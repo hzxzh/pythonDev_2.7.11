@@ -175,6 +175,7 @@ $RECYCLE.BIN/
 *.o
 *.sln
 *.res
+*.sln
 
 PC/*
 PC/VS9.0/*
