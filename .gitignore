@@ -162,3 +162,7 @@ $RECYCLE.BIN/
 
 # VisualStudioCode
 .vscode
+
+*.filters
+*.props
+*.vcxproj
