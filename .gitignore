@@ -166,3 +166,14 @@ $RECYCLE.BIN/
 *.filters
 *.props
 *.vcxproj
+*.tlog
+.lastbuildstate
+*.dll
+*.exe
+*.exp
+*.lib
+*.o
+*.sln
+*.res
+
+PC/*
