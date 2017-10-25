@@ -328,12 +328,264 @@ Pdata_popList(Pdata *self, Py_ssize_t start)
     }                                               \
   }
 
+/*
+ * new memo
+ * 
+ * A custom hashtable mapping void* to longs. This is used by the pickler for
+ * memoization. Using a custom hashtable rather than PyDict allows us to skip
+ * a bunch of unnecessary object creation. This makes a huge performance
+ * difference. 
+ * 
+ * PyMemoTable_Get / PyMemoTable_Set is faster than PyDict_GetItem / PyDict_SetItem
+ * because PyMemoTable use integer hash and skip lots of PyInt/PyLong creation.
+*/
+
+//#define USE_NEW_MEMO
+
+#ifdef USE_NEW_MEMO
+
+typedef struct {
+    PyObject *me_key;
+    long me_hash;
+    long me_value;
+} PyMemoEntry;
+    
+typedef struct {
+    Py_ssize_t mt_mask;
+    Py_ssize_t mt_used;
+    Py_ssize_t mt_allocated;
+    PyMemoEntry *mt_table;
+} PyMemoTable;
+
+#define MT_MINSIZE 8
+#define PERTURB_SHIFT 5
+
+static PyMemoTable *
+PyMemoTable_New(void)
+{
+    PyMemoTable *memo = PyMem_MALLOC(sizeof(PyMemoTable));
+    if (memo == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    memo->mt_used = 0;
+    memo->mt_allocated = MT_MINSIZE;
+    memo->mt_mask = MT_MINSIZE - 1;
+    memo->mt_table = PyMem_MALLOC(MT_MINSIZE * sizeof(PyMemoEntry));
+    if (memo->mt_table == NULL) {
+        PyMem_FREE(memo);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    memset(memo->mt_table, 0, MT_MINSIZE * sizeof(PyMemoEntry));
+
+    return memo;
+}
+
+static PyMemoTable *
+PyMemoTable_Copy(PyMemoTable *self)
+{
+    Py_ssize_t i;
+    PyMemoTable *new = PyMemoTable_New();
+    if (new == NULL)
+        return NULL;
+
+    new->mt_used = self->mt_used;
+    new->mt_allocated = self->mt_allocated;
+    new->mt_mask = self->mt_mask;
+    /* The table we get from _New() is probably smaller than we wanted.
+       Free it and allocate one that's the right size. */
+    PyMem_FREE(new->mt_table);
+    new->mt_table = PyMem_MALLOC(self->mt_allocated * sizeof(PyMemoEntry));
+    if (new->mt_table == NULL) {
+        PyMem_FREE(new);
+        return NULL;
+    }
+    for (i = 0; i < self->mt_allocated; i++) {
+        Py_XINCREF(self->mt_table[i].me_key);
+    }
+    memcpy(new->mt_table, self->mt_table,
+           sizeof(PyMemoEntry) * self->mt_allocated);
+
+    return new;
+}
+
+static Py_ssize_t
+PyMemoTable_Size(PyMemoTable *self)
+{
+    return self->mt_used;
+}
+
+static int
+PyMemoTable_Clear(PyMemoTable *self)
+{
+    Py_ssize_t i = self->mt_allocated;
+
+    while (--i >= 0) {
+        Py_XDECREF(self->mt_table[i].me_key);
+    }
+    self->mt_used = 0;
+    memset(self->mt_table, 0, self->mt_allocated * sizeof(PyMemoEntry));
+    return 0;
+}
+
+static void
+PyMemoTable_Del(PyMemoTable *self)
+{
+    if (self == NULL)
+        return;
+    PyMemoTable_Clear(self);
+
+    PyMem_FREE(self->mt_table);
+    PyMem_FREE(self);
+}
+
+/* Since entries cannot be deleted from this hashtable, _PyMemoTable_Lookup()
+   can be considerably simpler than dictobject.c's lookdict(). */
+static PyMemoEntry *
+_PyMemoTable_Lookup(PyMemoTable *self, PyObject *key)
+{
+    size_t i;
+    size_t perturb;
+    size_t mask = (size_t)self->mt_mask;
+    PyMemoEntry *table = self->mt_table;
+    PyMemoEntry *entry;
+
+    long hash = (long)key >> 3;
+
+    i = hash & mask;
+    entry = &table[i];
+    if (entry->me_key == NULL || entry->me_key == key)
+        return entry;
+
+    for (perturb = hash; ; perturb >>= PERTURB_SHIFT) {
+        i = (i << 2) + i + perturb + 1;
+        entry = &table[i & mask];
+        if (entry->me_key == NULL || entry->me_key == key)
+            return entry;
+    }
+    assert(0);  /* Never reached */
+    return NULL;
+}
+
+/* Returns -1 on failure, 0 on success. */
+static int
+_PyMemoTable_ResizeTable(PyMemoTable *self, Py_ssize_t min_size)
+{
+    PyMemoEntry *oldtable = NULL;
+    PyMemoEntry *oldentry, *newentry;
+    Py_ssize_t new_size = MT_MINSIZE;
+    Py_ssize_t to_process;
+
+    assert(min_size > 0);
+
+    /* Find the smallest valid table size >= min_size. */
+    while (new_size < min_size && new_size > 0)
+        new_size <<= 1;
+    if (new_size <= 0) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    /* new_size needs to be a power of two. */
+    assert((new_size & (new_size - 1)) == 0);
+
+    /* Allocate new table. */
+    oldtable = self->mt_table;
+    self->mt_table = PyMem_MALLOC(new_size * sizeof(PyMemoEntry));
+    if (self->mt_table == NULL) {
+        PyMem_FREE(oldtable);
+        PyErr_NoMemory();
+        return -1;
+    }
+    self->mt_allocated = new_size;
+    self->mt_mask = new_size - 1;
+    memset(self->mt_table, 0, sizeof(PyMemoEntry) * new_size);
+
+    /* Copy entries from the old table. */
+    to_process = self->mt_used;
+    for (oldentry = oldtable; to_process > 0; oldentry++) {
+        if (oldentry->me_key != NULL) {
+            to_process--;
+            /* newentry is a pointer to a chunk of the new
+               mt_table, so we're setting the key:value pair
+               in-place. */
+            newentry = _PyMemoTable_Lookup(self, oldentry->me_key);
+            newentry->me_key = oldentry->me_key;
+            newentry->me_value = oldentry->me_value;
+        }
+    }
+
+    /* Deallocate the old table. */
+    PyMem_FREE(oldtable);
+    return 0;
+}
+
+/* Returns NULL on failure, a pointer to the value otherwise. */
+static long *
+PyMemoTable_Get(PyMemoTable *self, PyObject *key)
+{
+    PyMemoEntry *entry = _PyMemoTable_Lookup(self, key);
+    if (entry->me_key == NULL)
+    {
+        return NULL;
+    }
+    return &entry->me_value;
+}
+
+/* Returns -1 on failure, 0 on success. */
+static int
+PyMemoTable_Set(PyMemoTable *self, PyObject *key, long value)
+{
+    PyMemoEntry *entry;
+
+    assert(key != NULL);
+
+    entry = _PyMemoTable_Lookup(self, key);
+    if (entry->me_key != NULL) {
+        entry->me_value = value;
+        return 0;
+    }
+    Py_INCREF(key);
+    entry->me_key = key;
+    entry->me_value = value;
+    self->mt_used++;
+
+    /* If we added a key, we can safely resize. Otherwise just return!
+     * If used >= 2/3 size, adjust size. Normally, this quaduples the size.
+     *
+     * Quadrupling the size improves average table sparseness
+     * (reducing collisions) at the cost of some memory. It also halves
+     * the number of expensive resize operations in a growing memo table.
+     *
+     * Very large memo tables (over 50K items) use doubling instead.
+     * This may help applications with severe memory constraints.
+     */
+    if (!(self->mt_used * 3 >= (self->mt_mask + 1) * 2))
+        return 0;
+    return _PyMemoTable_ResizeTable(self,
+        (self->mt_used > 50000 ? 2 : 4) * self->mt_used);
+}
+
+#undef MT_MINSIZE
+#undef PERTURB_SHIFT
+
+#endif
+
+/* new memo end*/
+
 typedef struct Picklerobject {
     PyObject_HEAD
     FILE *fp;
     PyObject *write;
     PyObject *file;
+
+#ifdef USE_NEW_MEMO
+    PyMemoTable *memo;
+#else
     PyObject *memo;
+#endif
+
     PyObject *arg;
     PyObject *pers_func;
     PyObject *inst_pers_func;
@@ -744,29 +996,51 @@ pystrndup(const char *s, Py_ssize_t n)
 static int
 get(Picklerobject *self, PyObject *id)
 {
+
+#ifdef USE_NEW_MEMO
+    long *value, *mv;
+    Py_ssize_t c_value;
+    char s[30];
+    size_t len;
+
+    if (!( mv = PyMemoTable_Get(self->memo, id)))
+    {
+        PyErr_SetObject(PyExc_KeyError, id);
+        return -1;
+    }
+
+    // mv is &entry->me_value, address of entry's me_value
+    value = *mv; 
+
+    c_value = value;
+
+#else
     PyObject *value, *mv;
     Py_ssize_t c_value;
     char s[30];
     size_t len;
 
-    if (!( mv = PyDict_GetItem(self->memo, id)))  {
+    if (!( mv = PyDict_GetItem(self->memo, id)))
+    {
         PyErr_SetObject(PyExc_KeyError, id);
         return -1;
     }
 
     if (!( value = PyTuple_GetItem(mv, 0)))
-        return -1;
+    return -1;
 
     if (!( PyInt_Check(value)))  {
         PyErr_SetString(PicklingError, "no int where int expected in memo");
         return -1;
     }
+
     c_value = PyInt_AS_LONG((PyIntObject*)value);
+#endif
 
     if (!self->bin) {
         s[0] = GET;
         PyOS_snprintf(s + 1, sizeof(s) - 1,
-                      "%" PY_FORMAT_SIZE_T "d\n", c_value);
+                        "%" PY_FORMAT_SIZE_T "d\n", c_value);
         len = strlen(s);
     }
     else if (Pdata_Check(self->file)) {
@@ -818,9 +1092,21 @@ put2(Picklerobject *self, PyObject *ob)
     if (self->fast)
         return 0;
 
+#ifdef USE_NEW_MEMO
+    if ((p = PyMemoTable_Size(self->memo)) < 0)
+        goto finally;
+#else
     if ((p = PyDict_Size(self->memo)) < 0)
         goto finally;
+#endif
 
+#ifdef USE_NEW_MEMO
+
+    p++;
+
+    if (PyMemoTable_Set(self->memo, ob, p) < 0)
+        goto finally;
+#else
     /* Make sure memo keys are positive! */
     /* XXX Why?
      * XXX And does "positive" really mean non-negative?
@@ -843,8 +1129,11 @@ put2(Picklerobject *self, PyObject *ob)
     PyTuple_SET_ITEM(t, 1, ob);
     Py_INCREF(ob);
 
+    // printf("dict set %u %u\n",p, memo_len);
+
     if (PyDict_SetItem(self->memo, py_ob_id, t) < 0)
         goto finally;
+#endif
 
     if (!self->bin) {
         c_str[0] = PUT;
@@ -1552,13 +1841,24 @@ save_tuple(Picklerobject *self, PyObject *args)
         /* Use TUPLE{1,2,3} opcodes. */
         if (store_tuple_elements(self, args, len) < 0)
             goto finally;
-        if (PyDict_GetItem(self->memo, py_tuple_id)) {
+
+#ifdef USE_NEW_MEMO
+        if (PyMemoTable_Get(self->memo, args))
+#else
+        if (PyDict_GetItem(self->memo, py_tuple_id)) 
+#endif
+        {
+            // printf("get py_tuple_id %d succ\n", py_tuple_id);
             /* pop the len elements */
             for (i = 0; i < len; ++i)
                 if (self->write_func(self, &pop, 1) < 0)
                     goto finally;
             /* fetch from memo */
+#ifdef USE_NEW_MEMO
+            if (get(self, args)<0)
+#else
             if (get(self, py_tuple_id) < 0)
+#endif
                 goto finally;
             res = 0;
             goto finally;
@@ -1578,7 +1878,13 @@ save_tuple(Picklerobject *self, PyObject *args)
     if (store_tuple_elements(self, args, len) < 0)
         goto finally;
 
-    if (PyDict_GetItem(self->memo, py_tuple_id)) {
+#ifdef USE_NEW_MEMO
+    if (PyMemoTable_Get(self->memo, args))
+#else
+    if (PyDict_GetItem(self->memo, py_tuple_id))
+#endif
+    {
+        // printf("get py_tuple_id %d succ\n", py_tuple_id);
         /* pop the stack stuff we pushed */
         if (self->bin) {
             if (self->write_func(self, &pop_mark, 1) < 0)
@@ -1593,7 +1899,11 @@ save_tuple(Picklerobject *self, PyObject *args)
                     goto finally;
         }
         /* fetch from memo */
+#ifdef USE_NEW_MEMO
+        if (get(self, args) >=0)
+#else
         if (get(self, py_tuple_id) >= 0)
+#endif
             res = 0;
         goto finally;
     }
@@ -2540,10 +2850,21 @@ save_reduce(Picklerobject *self, PyObject *args, PyObject *fn, PyObject *ob)
             PyObject *py_ob_id = PyLong_FromVoidPtr(ob);
             if (!py_ob_id)
                 return -1;
-            if (PyDict_GetItem(self->memo, py_ob_id)) {
+#ifdef USE_NEW_MEMO
+            if (PyMemoTable_Get(self->memo, ob))
+#else
+            if (PyDict_GetItem(self->memo, py_ob_id))
+#endif
+            {
+                // printf("get py_ob_id %d succ\n", py_ob_id);
                 const char pop_op = POP;
                 if (self->write_func(self, &pop_op, 1) < 0 ||
-                    get(self, py_ob_id) < 0) {
+#ifdef USE_NEW_MEMO
+                    get(self, ob) < 0)
+#else
+                    get(self, py_ob_id) < 0) 
+#endif
+                {
                     Py_DECREF(py_ob_id);
                     return -1;
                 }
@@ -2659,8 +2980,17 @@ save(Picklerobject *self, PyObject *args, int pers_save)
         if (!( py_ob_id = PyLong_FromVoidPtr(args)))
             goto finally;
 
-        if (PyDict_GetItem(self->memo, py_ob_id)) {
+#ifdef USE_NEW_MEMO
+        if (PyMemoTable_Get(self->memo, args))
+#else
+        if (PyDict_GetItem(self->memo, py_ob_id))
+#endif
+        {
+#ifdef USE_NEW_MEMO
+            if (get(self, args) < 0)
+#else
             if (get(self, py_ob_id) < 0)
+#endif
                 goto finally;
 
             res = 0;
@@ -2859,8 +3189,12 @@ dump(Picklerobject *self, PyObject *args)
 static PyObject *
 Pickle_clear_memo(Picklerobject *self, PyObject *args)
 {
-    if (self->memo)
+	if (self->memo)
+#ifdef USE_NEW_MEMO
+		PyMemoTable_Clear(self->memo);
+#else
         PyDict_Clear(self->memo);
+#endif
     Py_INCREF(Py_None);
     return Py_None;
 }
@@ -2892,7 +3226,11 @@ Pickle_getvalue(Picklerobject *self, PyObject *args)
     l=data->length;
 
     /* set up an array to hold get/put status */
+#ifdef USE_NEW_MEMO
+	lm = PyMemoTable_Size(self->memo);
+#else
     lm = PyDict_Size(self->memo);
+#endif
     if (lm < 0) return NULL;
     lm++;
     have_get = malloc(lm);
@@ -2991,7 +3329,11 @@ Pickle_getvalue(Picklerobject *self, PyObject *args)
     }
 
     if (clear) {
+#ifdef USE_NEW_MEMO
+		PyMemoTable_Clear(self->memo);
+#else
         PyDict_Clear(self->memo);
+#endif
         Pdata_clear(data, 0);
     }
 
@@ -3077,8 +3419,13 @@ newPicklerobject(PyObject *file, int proto)
     }
     self->file = file;
 
+#ifdef USE_NEW_MEMO
+    if (!(self->memo = PyMemoTable_New()))
+        goto err;
+#else
     if (!( self->memo = PyDict_New()))
         goto err;
+#endif
 
     if (PyFile_Check(file)) {
         self->fp = PyFile_AsFile(file);
@@ -3171,7 +3518,13 @@ Pickler_dealloc(Picklerobject *self)
 {
     PyObject_GC_UnTrack(self);
     Py_XDECREF(self->write);
+
+#ifdef USE_NEW_MEMO
+    PyMemoTable_Del(self->memo);
+#else
     Py_XDECREF(self->memo);
+#endif
+
     Py_XDECREF(self->fast_memo);
     Py_XDECREF(self->arg);
     Py_XDECREF(self->file);
@@ -3186,7 +3539,11 @@ static int
 Pickler_traverse(Picklerobject *self, visitproc visit, void *arg)
 {
     Py_VISIT(self->write);
+
+#ifndef USE_NEW_MEMO
     Py_VISIT(self->memo);
+#endif
+
     Py_VISIT(self->fast_memo);
     Py_VISIT(self->arg);
     Py_VISIT(self->file);
@@ -3200,7 +3557,17 @@ static int
 Pickler_clear(Picklerobject *self)
 {
     Py_CLEAR(self->write);
+#ifdef USE_NEW_MEMO
+    if (self->memo != NULL)
+    {
+        PyMemoTable *memo = self->memo;
+		self->memo = NULL;
+		PyMemoTable_Del(memo);
+    }
+#else
     Py_CLEAR(self->memo);
+#endif
+
     Py_CLEAR(self->fast_memo);
     Py_CLEAR(self->arg);
     Py_CLEAR(self->file);
@@ -5719,7 +6086,6 @@ cpm_dump(PyObject *self, PyObject *args, PyObject *kwds)
 
     return res;
 }
-
 
 /* dumps(obj, protocol=0). */
 static PyObject *
